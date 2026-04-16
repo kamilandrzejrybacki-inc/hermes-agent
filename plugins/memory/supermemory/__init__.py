@@ -12,6 +12,7 @@ import os
 import re
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -260,6 +261,113 @@ def _is_trivial_message(text: str) -> bool:
     return bool(_TRIVIAL_RE.match((text or "").strip()))
 
 
+
+class _LocalSupermemoryClient:
+    """Lightweight client for the hermes-supermemory sidecar.
+
+    Uses plain HTTP (no external SDK) against /api/memories.
+    Activated when SUPERMEMORY_BASE_URL is set in the environment.
+    """
+
+    def __init__(self, base_url: str, timeout: float, container_tag: str = "") -> None:
+        parsed = urllib.parse.urlparse(base_url)
+        self._host = parsed.hostname or "hermes-supermemory"
+        self._port = parsed.port or 3100
+        self._timeout = timeout
+        self._container_tag = container_tag  # kept for interface compat
+
+    def _get_memories(self) -> list:
+        url = f"http://{self._host}:{self._port}/api/memories"
+        with urllib.request.urlopen(url, timeout=self._timeout) as resp:
+            return json.loads(resp.read()).get("memories", [])
+
+    def _post(self, path: str, body: dict) -> dict:
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(
+            f"http://{self._host}:{self._port}{path}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            return json.loads(resp.read())
+
+    def _delete(self, path: str) -> None:
+        req = urllib.request.Request(
+            f"http://{self._host}:{self._port}{path}",
+            method="DELETE",
+        )
+        with urllib.request.urlopen(req, timeout=self._timeout):
+            pass
+
+    def add_memory(self, content: str, metadata: Optional[dict] = None, *,
+                   entity_context: str = "", container_tag: Optional[str] = None,
+                   custom_id: Optional[str] = None) -> dict:
+        tags = []
+        if metadata:
+            tags = [f"{k}:{v}" for k, v in metadata.items() if isinstance(v, str)]
+        body: dict = {
+            "content": content.strip(),
+            "title": content[:60].strip(),
+            "tags": tags,
+        }
+        result = self._post("/api/memories", body)
+        return {"id": result.get("memory", {}).get("id", "")}
+
+    def search_memories(self, query: str, *, limit: int = 5,
+                        container_tag: Optional[str] = None,
+                        search_mode: Optional[str] = None) -> list:
+        memories = self._get_memories()
+        query_lower = query.lower()
+        matched = [m for m in memories if query_lower in m.get("content", "").lower()]
+        return [
+            {
+                "id": m.get("id", ""),
+                "memory": m.get("content", ""),
+                "similarity": None,
+                "updated_at": m.get("updatedAt"),
+            }
+            for m in matched[:limit]
+        ]
+
+    def get_profile(self, query: Optional[str] = None, *,
+                    container_tag: Optional[str] = None) -> dict:
+        memories = self._get_memories()
+        # Return most recent memories as static facts (newest last → reverse slice)
+        static = [m.get("content", "") for m in memories[-20:] if m.get("content")]
+        return {"static": static, "dynamic": [], "search_results": []}
+
+    def forget_memory(self, memory_id: str, *, container_tag: Optional[str] = None) -> None:
+        self._delete(f"/api/memories/{memory_id}")
+
+    def forget_by_query(self, query: str, *, container_tag: Optional[str] = None) -> dict:
+        results = self.search_memories(query, limit=1)
+        if not results:
+            return {"success": False, "message": "No matching memory found to forget."}
+        target = results[0]
+        memory_id = target.get("id", "")
+        if not memory_id:
+            return {"success": False, "message": "Best matching memory has no id."}
+        self.forget_memory(memory_id)
+        preview = (target.get("memory") or "")[:100]
+        return {"success": True, "message": f'Forgot: "{preview}"', "id": memory_id}
+
+    def ingest_conversation(self, session_id: str, messages: list) -> None:
+        lines = [f"Session: {session_id}"]
+        for msg in messages:
+            role = msg.get("role", "")
+            content = (msg.get("content") or "").strip()
+            if role and content:
+                lines.append(f"[{role}]: {content}")
+        full = "\n".join(lines)
+        if len(full) >= 50:
+            self._post("/api/memories", {
+                "content": full,
+                "title": f"Session {session_id[:16]}",
+                "tags": ["session", "conversation"],
+            })
+
+
 class _SupermemoryClient:
     def __init__(self, api_key: str, timeout: float, container_tag: str, search_mode: str = "hybrid"):
         from supermemory import Supermemory
@@ -452,6 +560,8 @@ class SupermemoryMemoryProvider(MemoryProvider):
         return "supermemory"
 
     def is_available(self) -> bool:
+        if os.environ.get("SUPERMEMORY_BASE_URL", "").strip():
+            return True
         api_key = os.environ.get("SUPERMEMORY_API_KEY", "")
         if not api_key:
             return False
@@ -509,9 +619,22 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
         agent_context = kwargs.get("agent_context", "")
         self._write_enabled = agent_context not in ("cron", "flush", "subagent")
-        self._active = bool(self._api_key)
+        self._active = False
         self._client = None
-        if self._active:
+        base_url = os.environ.get("SUPERMEMORY_BASE_URL", "").strip()
+        if base_url:
+            try:
+                self._client = _LocalSupermemoryClient(
+                    base_url=base_url,
+                    timeout=self._api_timeout,
+                    container_tag=self._container_tag,
+                )
+                self._active = True
+                logger.info("Supermemory: using local sidecar at %s", base_url)
+            except Exception:
+                logger.warning("Supermemory local sidecar init failed", exc_info=True)
+        elif self._api_key:
+            self._active = True
             try:
                 self._client = _SupermemoryClient(
                     api_key=self._api_key,
